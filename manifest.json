@@ -1,0 +1,8 @@
+{
+    "domain": "xiaomi_miio_ext",
+    "name": "Xiaomi Heater",
+    "documentation": "https://www.home-assistant.io/integrations/xiaomi_miio",
+    "issue_tracker": "https://github.com/dracoa/homeassistant-mi-heater/issues",
+    "codeowners": ["@dracoa"],
+    "requirements": ["construct==2.10.56", "python-miio==0.5.4"]
+  }

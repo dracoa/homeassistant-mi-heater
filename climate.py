@@ -22,7 +22,7 @@ from homeassistant.exceptions import PlatformNotReady
 
 _LOGGER = logging.getLogger(__name__)
 
-REQUIREMENTS = ['python-miio>=0.3.1']
+REQUIREMENTS = ['python-miio==0.5.4']
 SUPPORT_FLAGS = (SUPPORT_TARGET_TEMPERATURE | SUPPORT_OPERATION_MODE |
                  SUPPORT_ON_OFF)
 SERVICE_SET_ROOM_TEMP = 'miheater_set_room_temperature'
