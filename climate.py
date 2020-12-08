@@ -1,191 +1,204 @@
-"""
-    Support for Xiaomi wifi-enabled home heaters via miio.
-    author: sunfang1cn@gmail.com
-"""
+import voluptuous as vol
+from enum import Enum
+from functools import partial
 import logging
 
-import voluptuous as vol
-
-from homeassistant.components.climate import ClimateDevice, PLATFORM_SCHEMA
-from homeassistant.components.climate.const import (
-    DOMAIN, STATE_HEAT, STATE_COOL,
-    SUPPORT_TARGET_TEMPERATURE, SUPPORT_FAN_MODE,
-    SUPPORT_ON_OFF, SUPPORT_OPERATION_MODE)
+from miio import (  # pylint: disable=import-error
+    Device,
+    DeviceException,
+)
+from homeassistant.components.climate import ClimateEntity
 from homeassistant.const import (
-    ATTR_TEMPERATURE, CONF_HOST, CONF_NAME, CONF_TOKEN,
-    STATE_ON, STATE_OFF, TEMP_CELSIUS)
+    ATTR_ENTITY_ID,
+    ATTR_MODE,
+    CONF_HOST,
+    CONF_NAME,
+    CONF_TOKEN,
+)
+from homeassistant.exceptions import PlatformNotReady, ConfigEntryNotReady
 from homeassistant.helpers import config_validation as cv
-from homeassistant.helpers.entity import generate_entity_id
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
-from homeassistant.exceptions import PlatformNotReady
-
 
 _LOGGER = logging.getLogger(__name__)
 
-REQUIREMENTS = ['python-miio==0.5.4']
-SUPPORT_FLAGS = (SUPPORT_TARGET_TEMPERATURE | SUPPORT_OPERATION_MODE |
-                 SUPPORT_ON_OFF)
-SERVICE_SET_ROOM_TEMP = 'miheater_set_room_temperature'
-MIN_TEMP = 16
-MAX_TEMP = 32
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend({
-    vol.Required(CONF_HOST): cv.string,
-    vol.Required(CONF_NAME): cv.string,
-    vol.Required(CONF_TOKEN): cv.string,
-})
+DEFAULT_NAME = "Xiaomi Heater"
+DATA_KEY = "heater.xiaomi_miio"
+ATTR_MODEL = "model"
+SUCCESS = ["ok"]
 
-SET_ROOM_TEMP_SCHEMA = vol.Schema({
-    vol.Optional('temperature'): cv.positive_int
-})
+FEATURE_SET_BUZZER = 1
+FEATURE_SET_CHILD_LOCK = 4
 
 
-
-def setup_platform(hass, config, add_devices, discovery_info=None):
+async def async_setup_entry(hass, config, async_add_entities, discovery_info=None):
     """Perform the setup for Xiaomi heaters."""
-    from miio import Device, DeviceException
+    if DATA_KEY not in hass.data:
+        hass.data[DATA_KEY] = {}
 
     host = config.get(CONF_HOST)
     name = config.get(CONF_NAME)
     token = config.get(CONF_TOKEN)
 
-    _LOGGER.info("Initializing Xiaomi heaters with host %s (token %s...)", host, token[:5])
-
-    devices = []
+    _LOGGER.info(
+        "Initializing Xiaomi heaters with host %s (token %s...)", host, token[:5])
     unique_id = None
 
     try:
-        device = Device(host, token)
-
-        device_info = device.info()
+        miio_device = Device(host, token)
+        device_info = await hass.async_add_executor_job(miio_device.info)
         model = device_info.model
-        unique_id = "{}-{}".format(model, device_info.mac_address)
-        _LOGGER.info("%s %s %s detected",
-                     model,
-                     device_info.firmware_version,
-                     device_info.hardware_version)
-        miHeater = MiHeater(device, name, unique_id, hass)
-        devices.append(miHeater)
-        add_devices(devices)
-        async def set_room_temp(service):
-            """Set room temp."""
-            temperature = service.data.get('temperature')
-            await miHeater.async_set_temperature(temperature)
-
-        hass.services.async_register(DOMAIN, SERVICE_SET_ROOM_TEMP,
-                                     set_room_temp, schema=SET_ROOM_TEMP_SCHEMA)
-    except DeviceException:
-        _LOGGER.exception('Fail to setup Xiaomi heater')
-        raise PlatformNotReady
+        unique_id = f"{model}-{device_info.mac_address}"
+        _LOGGER.info(
+            "%s %s %s detected",
+            model,
+            device_info.firmware_version,
+            device_info.hardware_version,
+        )
+    except DeviceException as ex:
+        raise PlatformNotReady from ex
+    
+    device = MiHeater(name, miio_device, model, unique_id)
+    hass.data[DATA_KEY][host] = device
+    async_add_entities([device], update_before_add=True)
 
 
+class MiHeater(ClimateEntity):
+    """Representation of a generic Xiaomi device."""
 
-class MiHeater(ClimateDevice):
-    from miio import DeviceException
-
-    """Representation of a MiHeater device."""
-
-    def __init__(self, device, name, unique_id, _hass):
-        """Initialize the heater."""
-        self._device = device
+    def __init__(self, name, device, model, unique_id):
+        """Initialize the generic Xiaomi device."""
         self._name = name
+        self._device = device
+        self._model = model
+        self._unique_id = unique_id
+
+        self._available = False
         self._state = None
-        self.entity_id = generate_entity_id('climate.{}', unique_id, hass=_hass)
-        self.getAttrData()
-    @property
-    def name(self):
-        """Return the name of the device."""
-        return self._name
+        self._state_attrs = {ATTR_MODEL: self._model}
+        self._device_features = FEATURE_SET_CHILD_LOCK
+        self._skip_update = False
 
     @property
     def supported_features(self):
-        """Return the list of supported features."""
-        return SUPPORT_FLAGS
-    @property
-    def temperature_unit(self):
-        """Return the unit of measurement which this thermostat uses."""
-        return TEMP_CELSIUS
-    @property
-    def target_temperature(self):
-        """Return the temperature we try to reach."""
-        return self._state['target_temperature'][0]
+        """Flag supported features."""
+        return SUPPORT_SET_SPEED
 
     @property
-    def current_temperature(self):
-        """Return the current temperature."""
-        return self._state['current_temperature'][0]
+    def should_poll(self):
+        """Poll the device."""
+        return True
 
     @property
-    def target_temperature_step(self):
-        """Return the supported step of target temperature."""
-        return 1
-    def getAttrData(self):
-        try:
-            data = {}
-            data['power'] = self._device.send('get_prop', ['power'])
-            data['humidity'] = self._device.send('get_prop', ['relative_humidity'])
-            data['target_temperature'] = self._device.send('get_prop', ['target_temperature'])
-            data['current_temperature'] = self._device.send('get_prop', ['temperature'])
-            self._state = data
-        except DeviceException:
-            _LOGGER.exception('Fail to get_prop from Xiaomi heater')
-            self._state = None
-            raise PlatformNotReady
+    def unique_id(self):
+        """Return an unique ID."""
+        return self._unique_id
+
+    @property
+    def name(self):
+        """Return the name of the device if any."""
+        return self._name
+
+    @property
+    def available(self):
+        """Return true when state is known."""
+        return self._available
 
     @property
     def device_state_attributes(self):
-        return self._state
+        """Return the state attributes of the device."""
+        return self._state_attrs
 
     @property
     def is_on(self):
-        """Return true if heater is on."""
-        return self._state['power'][0] == 'on'
+        """Return true if device is on."""
+        return self._state
 
-    @property
-    def min_temp(self):
-        """Return the minimum temperature."""
-        return MIN_TEMP
+    @staticmethod
+    def _extract_value_from_attribute(state, attribute):
+        value = getattr(state, attribute)
+        if isinstance(value, Enum):
+            return value.value
 
-    @property
-    def max_temp(self):
-        """Return the maximum temperature."""
-        return MAX_TEMP
+        return value
 
-    @property
-    def current_operation(self):
-        """Return current operation."""
-        return STATE_HEAT if self._state['power'][0] == 'on' else STATE_OFF
+    async def _try_command(self, mask_error, func, *args, **kwargs):
+        """Call a miio device command handling error messages."""
+        try:
+            result = await self.hass.async_add_executor_job(
+                partial(func, *args, **kwargs)
+            )
 
-    @property
-    def operation_list(self):
-        """List of available operation modes."""
-        return [STATE_HEAT, STATE_OFF]
+            _LOGGER.debug("Response received from miio device: %s", result)
 
-    async def async_set_temperature(self, **kwargs):
-        """Set new target temperature."""
-        temperature = kwargs.get(ATTR_TEMPERATURE)
-        if temperature is None:
+            return result == SUCCESS
+        except DeviceException as exc:
+            if self._available:
+                _LOGGER.error(mask_error, exc)
+                self._available = False
+
+            return False
+
+    async def async_turn_on(self, speed: str = None, **kwargs) -> None:
+        """Turn the device on."""
+
+        result = await self._try_command(
+            "Turning the miio device on failed.", self._device.on
+        )
+
+        if result:
+            self._state = True
+            self._skip_update = True
+
+    async def async_turn_off(self, **kwargs) -> None:
+        """Turn the device off."""
+        result = await self._try_command(
+            "Turning the miio device off failed.", self._device.off
+        )
+
+        if result:
+            self._state = False
+            self._skip_update = True
+
+    async def async_set_buzzer_on(self):
+        """Turn the buzzer on."""
+        if self._device_features & FEATURE_SET_BUZZER == 0:
             return
-        self._device.send('set_target_temperature', [int(temperature)])
 
+        await self._try_command(
+            "Turning the buzzer of the miio device on failed.",
+            self._device.set_buzzer,
+            True,
+        )
 
-    async def async_turn_on(self):
-        """Turn Mill unit on."""
-        self._device.send('set_power', ['on'])
+    async def async_set_buzzer_off(self):
+        """Turn the buzzer off."""
+        if self._device_features & FEATURE_SET_BUZZER == 0:
+            return
 
-    async def async_turn_off(self):
-        """Turn Mill unit off."""
-        self._device.send('set_power', ['off'])
+        await self._try_command(
+            "Turning the buzzer of the miio device off failed.",
+            self._device.set_buzzer,
+            False,
+        )
 
+    async def async_set_child_lock_on(self):
+        """Turn the child lock on."""
+        if self._device_features & FEATURE_SET_CHILD_LOCK == 0:
+            return
 
-    async def async_update(self):
-        """Retrieve latest state."""
-        self.getAttrData()
+        await self._try_command(
+            "Turning the child lock of the miio device on failed.",
+            self._device.set_child_lock,
+            True,
+        )
 
-    async def async_set_operation_mode(self, operation_mode):
-        """Set operation mode."""
-        if operation_mode == STATE_HEAT or operation_mode == STATE_COOL:
-            await self.async_turn_on()
-        elif operation_mode == STATE_OFF:
-            await self.async_turn_off()
-        else:
-            _LOGGER.error("Unrecognized operation mode: %s", operation_mode)
+    async def async_set_child_lock_off(self):
+        """Turn the child lock off."""
+        if self._device_features & FEATURE_SET_CHILD_LOCK == 0:
+            return
+
+        await self._try_command(
+            "Turning the child lock of the miio device off failed.",
+            self._device.set_child_lock,
+            False,
+        )
